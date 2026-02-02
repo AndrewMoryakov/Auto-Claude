@@ -43,9 +43,9 @@ export async function createTerminal(
   getWindow: WindowGetter,
   dataHandler: DataHandlerFn
 ): Promise<TerminalOperationResult> {
-  const { id, cwd, cols = 80, rows = 24, projectPath } = options;
+  const { id, cwd, cols = 80, rows = 24, projectPath, skipOAuthToken, env: customEnv } = options;
 
-  debugLog('[TerminalLifecycle] Creating terminal:', { id, cwd, cols, rows, projectPath });
+  debugLog('[TerminalLifecycle] Creating terminal:', { id, cwd, cols, rows, projectPath, skipOAuthToken, hasCustomEnv: !!customEnv });
 
   if (terminals.has(id)) {
     debugLog('[TerminalLifecycle] Terminal already exists, returning success:', id);
@@ -53,10 +53,19 @@ export async function createTerminal(
   }
 
   try {
-    const profileEnv = PtyManager.getActiveProfileEnv();
+    // For auth terminals, don't inject existing OAuth token - we want a fresh login
+    const profileEnv = skipOAuthToken ? {} : PtyManager.getActiveProfileEnv();
 
-    if (profileEnv.CLAUDE_CODE_OAUTH_TOKEN) {
+    // Merge custom environment variables (e.g., CLAUDE_CONFIG_DIR for auth terminals)
+    const mergedEnv = customEnv ? { ...profileEnv, ...customEnv } : profileEnv;
+
+    if (mergedEnv.CLAUDE_CODE_OAUTH_TOKEN) {
       debugLog('[TerminalLifecycle] Injecting OAuth token from active profile');
+    } else if (skipOAuthToken) {
+      debugLog('[TerminalLifecycle] Skipping OAuth token injection (auth terminal)');
+    }
+    if (mergedEnv.CLAUDE_CONFIG_DIR) {
+      debugLog('[TerminalLifecycle] Setting CLAUDE_CONFIG_DIR:', mergedEnv.CLAUDE_CONFIG_DIR);
     }
 
     // Validate cwd exists - if the directory doesn't exist (e.g., worktree removed),
@@ -71,7 +80,7 @@ export async function createTerminal(
       effectiveCwd || os.homedir(),
       cols,
       rows,
-      profileEnv
+      mergedEnv
     );
 
     debugLog('[TerminalLifecycle] PTY process spawned, pid:', ptyProcess.pid, 'shellType:', shellType);
@@ -139,6 +148,11 @@ export async function restoreTerminal(
     'Passed Claude mode:', session.isClaudeMode,
     'Stored Claude mode:', storedIsClaudeMode,
     'Stored session ID:', storedClaudeSessionId);
+
+  // Debug: Log outputBuffer info from both passed and stored session
+  const passedBufferLen = session.outputBuffer?.length ?? 0;
+  const storedBufferLen = storedSession?.outputBuffer?.length ?? 0;
+  debugLog('[TerminalLifecycle] OutputBuffer info - passed session:', passedBufferLen, 'bytes, stored session:', storedBufferLen, 'bytes');
 
   // Validate cwd exists - if the directory was deleted (e.g., worktree removed),
   // fall back to project path to prevent shell exit with code 1
@@ -226,6 +240,12 @@ export async function restoreTerminal(
     }
   }
 
+  // Debug: Log the outputBuffer being returned for replay
+  const returnBufferLen = session.outputBuffer?.length ?? 0;
+  debugLog('[TerminalLifecycle] Returning outputBuffer for terminal:', session.id,
+    'length:', returnBufferLen, 'bytes',
+    'hasContent:', returnBufferLen > 0);
+
   return {
     success: true,
     outputBuffer: session.outputBuffer
@@ -274,12 +294,27 @@ export async function destroyTerminal(
 }
 
 /**
- * Kill all terminal processes
+ * Global timeout for destroyAllTerminals to prevent shutdown from hanging (ms).
+ */
+const DESTROY_ALL_TIMEOUT = 3000;
+
+/**
+ * Kill all terminal processes.
+ * Sets the shutdown flag first to prevent PTY handlers from accessing destroyed
+ * resources, then waits for all PTY processes to exit (with a global timeout).
+ *
+ * This is the core fix for GitHub issue #1469: by setting the shutdown flag and
+ * awaiting PTY exit before returning, we ensure pty.node's native callbacks
+ * don't fire after the JS environment tears down (which causes SIGABRT).
  */
 export async function destroyAllTerminals(
   terminals: Map<string, TerminalProcess>,
   saveTimer: NodeJS.Timeout | null
 ): Promise<NodeJS.Timeout | null> {
+  // Set shutdown flag first — prevents PTY onData/onExit from accessing
+  // destroyed BrowserWindow.webContents (GitHub #1469 shutdown guard pattern)
+  PtyManager.setShuttingDown(true);
+
   await SessionHandler.persistAllSessionsAsync(terminals);
 
   if (saveTimer) {
@@ -287,25 +322,24 @@ export async function destroyAllTerminals(
     saveTimer = null;
   }
 
-  const promises: Promise<void>[] = [];
+  // Kill all terminals and wait for PTY exit to avoid pty.node SIGABRT on shutdown (GitHub #1469)
+  const killPromises: Promise<void>[] = [];
 
   terminals.forEach((terminal) => {
-    promises.push(
-      new Promise((resolve) => {
-        try {
-          // Note: We intentionally don't wait for PTY exit here (unlike destroyTerminal)
-          // because this function is only called during app shutdown when no terminals
-          // will be recreated. Waiting would only delay shutdown unnecessarily.
-          PtyManager.killPty(terminal);
-        } catch {
-          // Ignore errors during cleanup
-        }
-        resolve();
+    killPromises.push(
+      PtyManager.killPty(terminal, true).catch((error) => {
+        console.warn('[TerminalLifecycle] Error during PTY cleanup:', error);
       })
     );
   });
 
-  await Promise.all(promises);
+  // Wait for all PTY processes to exit, but cap with a global timeout
+  // so shutdown never hangs indefinitely
+  await Promise.race([
+    Promise.all(killPromises),
+    new Promise<void>((resolve) => setTimeout(resolve, DESTROY_ALL_TIMEOUT))
+  ]);
+
   terminals.clear();
 
   return saveTimer;
